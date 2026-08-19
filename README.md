@@ -69,8 +69,11 @@ cd ../clipper && uv venv && uv pip install -r requirements.txt -r requirements-l
 ### 4. Launch the GUI
 
 ```
-generator\.venv\Scripts\python.exe gui.py
+uv run gui.py
 ```
+
+(Equivalent, using the generator's virtualenv directly:
+`generator\.venv\Scripts\python.exe gui.py`)
 
 Three tabs:
 

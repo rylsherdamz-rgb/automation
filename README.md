@@ -75,15 +75,17 @@ uv run gui.py
 (Equivalent, using the generator's virtualenv directly:
 `generator\.venv\Scripts\python.exe gui.py`)
 
-Three tabs:
+Three views (sidebar navigation):
 
-- **Generator** — set niche / audience / length / voice / music, press *Generate
-  Video*. Watch every stage stream into the console. The full script is always
-  spoken — the last scene is padded so nothing gets cut, and a synthesized
-  ambient music bed is mixed under the narration (tunable volume).
-- **Clipper** — paste a YouTube URL or pick a local file, choose clip count,
-  aspect ratio (9:16 for Shorts/Reels), and a **minimum clip length** so shorts
-  are never too short. Press *Clip Video*.
+- **Create Video** — set niche / audience / length / voice / music, press *Generate
+  Video*. Watch live **% progress** per stage (script → voice → captions →
+  b-roll → assembly), with a status pill and the latest output card. The full
+  script is always spoken — the last scene is padded so nothing gets cut, and a
+  synthesized ambient music bed is mixed under the narration.
+- **Clip to Shorts** — paste a YouTube URL or pick a local file, choose clip
+  count, aspect ratio (9:16 for Shorts/Reels), and a **minimum clip length** so
+  shorts are never too short. Live % progress across download → transcript →
+  highlight ranking → rendering.
 - **Guide** — the step-by-step reference below, in-app.
 
 Both pipelines run independently and can be started at the same time. Errors

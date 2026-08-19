@@ -1,0 +1,14 @@
+.env
+output/
+state.json
+last_upload_date.txt
+logs/
+client_secret.json
+token.json
+__pycache__/
+*.pyc
+.venv/
+*.log
+.DS_Store
+.vscode/
+.idea/

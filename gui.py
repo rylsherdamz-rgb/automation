@@ -1,18 +1,22 @@
 """Faceless YouTube Automation Studio — tkinter GUI for both pipelines.
 
 Design: consumer-style dark app with a sidebar, live % progress for each
-pipeline (parsed from their stage output), and output cards with one-click
-open. The Generator creates faceless videos from a topic; the Clipper chops a
-long video into vertical shorts. Run:
+pipeline (parsed from their stage output), environment health checks, and
+clickable output history. The Generator creates faceless videos from a topic;
+the Clipper chops a long video into vertical shorts. Run:
 
     uv run gui.py
 """
+import copy
+import json
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
@@ -26,13 +30,13 @@ CLIP_DIR = ROOT / "clipper"
 GEN_PY = GEN_DIR / ".venv" / "Scripts" / "python.exe"
 CLIP_PY = CLIP_DIR / ".venv" / "Scripts" / "python.exe"
 GEN_CONFIG = GEN_DIR / "config.yaml"
+GEN_OUT_DIR = GEN_DIR / "output"
+CLIP_OUT_DIR = CLIP_DIR / "output"
+STATE_FILE = ROOT / "gui_state.json"
+LOG_DIR = ROOT / "logs"
+HISTORY_LIMIT = 12
 
 _FFMPEG_PKG = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Packages"
-_FFMPEG_DIR = next(
-    (_FFMPEG_PKG / p / "ffmpeg-9.0-full_build" / "bin"
-     for p in os.listdir(_FFMPEG_PKG) if p.startswith("Gyan.FFmpeg"))
-    if _FFMPEG_PKG.exists() else iter(()), None
-)
 
 VOICES = [
     "en-US-ChristopherNeural", "en-US-GuyNeural", "en-US-EricNeural",
@@ -57,6 +61,7 @@ GREEN = "#3ddc97"
 PINK = "#f472b6"
 RED = "#ff6b6b"
 YELLOW = "#ffd166"
+ORANGE = "#ffb454"
 DANGER = "#8f2d3d"
 
 # ------------------------------------------------------- generator stages ---
@@ -83,11 +88,70 @@ def _now():
     return datetime.now().strftime("%H:%M:%S")
 
 
+def _fmt_elapsed(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def _find_ffmpeg_dir() -> Path | None:
+    """Locate the WinGet-installed ffmpeg bin dir (any version)."""
+    if not _FFMPEG_PKG.exists():
+        return None
+    try:
+        for p in _FFMPEG_PKG.iterdir():
+            if not p.name.startswith("Gyan.FFmpeg") or not p.is_dir():
+                continue
+            for d in p.iterdir():
+                if (d / "bin" / "ffmpeg.exe").exists():
+                    return d / "bin"
+    except OSError:
+        pass
+    return None
+
+
 def _run_env() -> dict:
     env = dict(os.environ)
-    if _FFMPEG_DIR and _FFMPEG_DIR.exists():
-        env["PATH"] = str(_FFMPEG_DIR) + os.pathsep + env.get("PATH", "")
+    d = _find_ffmpeg_dir()
+    if d:
+        env["PATH"] = str(d) + os.pathsep + env.get("PATH", "")
+    # Force child Python processes to flush stdout/stderr line-by-line so the
+    # GUI receives stage markers live instead of in one big chunk at the end.
+    env["PYTHONUNBUFFERED"] = "1"
     return env
+
+
+def find_ffmpeg() -> str | None:
+    """Resolve the ffmpeg executable that child pipelines will actually use."""
+    env = _run_env()
+    return shutil.which("ffmpeg", path=env.get("PATH", ""))
+
+
+def _read_env(path: Path) -> dict:
+    data = {}
+    try:
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            data[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return data
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _write_json(path: Path, data: dict):
+    try:
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except OSError:
+        pass
 
 
 # ------------------------------------------------------- generator config ---
@@ -118,7 +182,6 @@ def _deep_merge(base: dict, extra: dict):
 
 
 def load_gen_config() -> dict:
-    import copy
     cfg = copy.deepcopy(DEFAULT_GEN)
     try:
         if GEN_CONFIG.exists():
@@ -135,39 +198,70 @@ def save_gen_config(cfg: dict):
 
 # ------------------------------------------------------------- progress -----
 class PipeProgress:
+    IDLE, RUNNING, STOPPED, FAILED, DONE = range(5)
+
     def __init__(self):
+        self.state = self.IDLE
         self.pct = 0.0
         self.target = 0.0
-        self.stage = "Waiting"
-        self.running = False
+        self.stage = "Idle"
+        self.started = 0.0
+        self._breathe = 0
 
     def start(self, label="Starting"):
-        self.running = True
-        self.pct = 2.0
-        self.target = 4.0
+        self.state = self.RUNNING
+        self.started = time.time()
+        self.pct = 3.0
+        self.target = 6.0
         self.stage = label
+        self._breathe = 0
 
     def set_stage(self, base: float, weight: float, label: str):
+        if self.state != self.RUNNING:
+            return
         self.pct = max(self.pct, base + 1.0)
         self.target = base + weight
         self.stage = label
+        self._breathe = 0
 
     def set_pct(self, pct: float, label: str):
+        if self.state != self.RUNNING:
+            return
         self.pct = max(self.pct, pct)
         self.target = max(self.target, pct + 1)
         self.stage = label
+        self._breathe = 0
 
     def tick(self) -> int:
-        if self.running and self.target > self.pct:
-            self.pct += (self.target - self.pct) * 0.08
+        if self.state != self.RUNNING:
+            return int(min(100.0, self.pct))
+        if self.pct < self.target:
+            self.pct += (self.target - self.pct) * 0.10
             if self.pct >= self.target:
-                self.pct = self.target * 0.99
+                self.pct = self.target
+        else:
+            # Breathing: while a stage is still working, slowly pulse near the
+            # stage ceiling so the bar never looks frozen.
+            self._breathe += 1
+            phase = (self._breathe % 24) / 12
+            self.pct = self.target - 0.6 + 0.6 * abs(phase - 1)
         return int(min(100.0, self.pct))
 
     def finish(self):
-        self.running = False
+        self.state = self.DONE
         self.pct = 100.0
         self.stage = "Done"
+
+    def fail(self, msg="Failed"):
+        self.state = self.FAILED
+        self.stage = msg
+
+    def stop(self):
+        self.state = self.STOPPED
+        self.stage = "Stopped"
+
+    def elapsed(self) -> float:
+        return time.time() - self.started if self.started else 0.0
 
 
 # ------------------------------------------------------------- proc thread --
@@ -180,8 +274,10 @@ class ProcThread(threading.Thread):
         self.cwd = cwd
         self.env = env
         self.proc = None
+        self.stopped = False
 
     def run(self):
+        code = -1
         try:
             self.proc = subprocess.Popen(
                 self.cmd, cwd=str(self.cwd), env=self.env,
@@ -191,12 +287,15 @@ class ProcThread(threading.Thread):
             for line in self.proc.stdout:
                 self.q.put((self.tag, line.rstrip()))
             self.proc.wait()
+            code = self.proc.returncode
         except Exception as e:
             self.q.put((self.tag, f"launch error: {e}"))
+            code = 1
         finally:
-            self.q.put((self.tag, None))
+            self.q.put((self.tag, None, code))
 
     def stop(self):
+        self.stopped = True
         if self.proc and self.proc.poll() is None:
             try:
                 self.proc.terminate()
@@ -209,8 +308,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Faceless Studio")
-        self.geometry("1240x860")
-        self.minsize(1020, 700)
+        self.geometry("1280x880")
+        self.minsize(1040, 720)
         self.configure(bg=BG)
         self.q: "queue.Queue" = queue.Queue()
         self.procs: dict[str, ProcThread] = {}
@@ -218,11 +317,21 @@ class App(tk.Tk):
         self.clip_prog = PipeProgress()
         self._last_gen_pct = -1
         self._last_clip_pct = -1
+        self._last_error: dict[str, str] = {}
+        self._run_log: dict[str, object] = {}          # tag -> (Path, file handle)
+        self._last_log_path: dict[str, Path] = {}
+        self._spinner = 0
         self._view = "create"
+        self.state = _read_json(STATE_FILE)
+        self._gen_out_path: Path | None = None
+        self._gen_hist: list[tuple[str, Path]] = []
+        self._clip_hist: list[tuple[str, Path]] = []
         self._build_styles()
         self._build_ui()
+        self._jobs: list[str] = []
         self._poll_queue()
         self._tick_progress()
+        self._jobs.append(self.after(400, self._doctor))
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ---------------------------------------------------------- styles -----
@@ -243,11 +352,17 @@ class App(tk.Tk):
         st.configure("Muted.TLabel", background=SURFACE2, foreground=MUTED)
         st.configure("H1.TLabel", background=BG, foreground=FG, font=("Segoe UI", 21, "bold"))
         st.configure("Tag.TLabel", background=BG, foreground=MUTED, font=("Segoe UI", 9))
+        st.configure("Foot.TLabel", background=SURFACE, foreground=MUTED, font=("Segoe UI", 9))
+        st.configure("FootOk.TLabel", background=SURFACE, foreground=GREEN, font=("Segoe UI", 9, "bold"))
+        st.configure("FootErr.TLabel", background=SURFACE, foreground=RED, font=("Segoe UI", 9, "bold"))
         st.configure("Section.TLabel", background=SURFACE2, foreground=MUTED,
                      font=("Segoe UI", 10, "bold"))
         st.configure("CardTitle.TLabel", background=SURFACE2, foreground=FG,
                      font=("Segoe UI", 12, "bold"))
         st.configure("Stage.TLabel", background=SURFACE2, foreground=MUTED, font=("Segoe UI", 10))
+        st.configure("StageRunning.TLabel", background=SURFACE2, foreground=ACCENT2,
+                     font=("Segoe UI", 10))
+        st.configure("StageErr.TLabel", background=SURFACE2, foreground=RED, font=("Segoe UI", 10))
         st.configure("Pct.TLabel", background=SURFACE2, foreground=ACCENT,
                      font=("Segoe UI", 14, "bold"))
         st.configure("Pill.TLabel", background=SURFACE, foreground=GREEN,
@@ -266,7 +381,8 @@ class App(tk.Tk):
         st.map("Danger.TButton", background=[("active", "#a53a4d"), ("disabled", "#3c2a30")])
         st.configure("Ghost.TButton", background=SURFACE2, foreground=FG, borderwidth=1,
                      padding=(12, 7))
-        st.map("Ghost.TButton", background=[("active", SURFACE3)])
+        st.map("Ghost.TButton", background=[("active", SURFACE3), ("disabled", SURFACE2)],
+               foreground=[("disabled", MUTED)])
 
         st.configure("Nav.TButton", background=SURFACE, foreground=MUTED,
                      font=("Segoe UI", 12), padding=(18, 13), borderwidth=0, anchor="w")
@@ -295,6 +411,14 @@ class App(tk.Tk):
         s.insert(0, val)
         return s
 
+    def _listbox(self, parent, height=5):
+        lb = tk.Listbox(parent, bg="#0e1220", fg=FG, relief="flat",
+                        font=("Consolas", 9), height=height,
+                        selectbackground=ACCENT_DIM, selectforeground=FG,
+                        activestyle="none", exportselection=False,
+                        highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT)
+        return lb
+
     def _card(self, parent, title, section=None):
         card = ttk.Frame(parent, style="Card.TFrame")
         card.pack(fill="x", padx=2, pady=(0, 14))
@@ -307,6 +431,36 @@ class App(tk.Tk):
         body.pack(fill="x", padx=18, pady=(4, 16))
         return card, body
 
+    def _scroll_view(self, parent):
+        """Create a scrollable canvas; the inner frame is a child of the canvas.
+
+        Returns (canvas, inner) — pack cards into `inner`. The inner frame is a
+        plain tk.Frame (the canonical canvas-window pattern) so it always draws.
+        """
+        canvas = tk.Canvas(parent, bg=SURFACE, highlightthickness=0, bd=0)
+        sb = ttk.Scrollbar(parent, command=canvas.yview)
+        inner = tk.Frame(canvas, bg=SURFACE)
+        win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=sb.set)
+
+        def _on_inner_cfg(_e):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_cfg(e):
+            canvas.itemconfigure(win_id, width=e.width)
+
+        def _on_wheel(e):
+            canvas.yview_scroll(int(-e.delta / 120), "units")
+
+        inner.bind("<Configure>", _on_inner_cfg)
+        canvas.bind("<Configure>", _on_canvas_cfg)
+        for w in (canvas, inner):
+            w.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_wheel))
+            w.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+        sb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        return canvas, inner
+
     # ------------------------------------------------------------ layout ----
     def _build_ui(self):
         self._header()
@@ -315,12 +469,14 @@ class App(tk.Tk):
         self._nav(root)
         self.main = ttk.Frame(root, style="Surface.TFrame")
         self.main.pack(side="left", fill="both", expand=True, padx=(16, 0))
-        self.views: dict[str, ttk.Frame] = {}
+        self.views: dict[str, tk.Widget] = {}
         self.views["create"] = self._build_create(self.main)
         self.views["clip"] = self._build_clip(self.main)
         self.views["guide"] = self._build_guide(self.main)
-        self._set_view("create")
+        self._set_view(self.state.get("view", "create"))
         self._build_console()
+        self._build_statusbar()
+        self._restore_state()
 
     def _header(self):
         head = ttk.Frame(self)
@@ -352,18 +508,27 @@ class App(tk.Tk):
 
     def _set_view(self, key: str):
         self._view = key
+        try:
+            self.unbind_all("<MouseWheel>")
+        except tk.TclError:
+            pass
         for k, f in self.views.items():
             f.pack_forget()
         self.views[key].pack(fill="both", expand=True, padx=18, pady=16)
         for k, b in self.nav_btns.items():
             b.configure(style="NavActive.TButton" if k == key else "Nav.TButton")
+        if key == "create":
+            self._refresh_gen_history()
+        elif key == "clip":
+            self._refresh_clip_history()
 
     # ------------------------------------------------------- CREATE view ----
     def _build_create(self, parent):
         v = ttk.Frame(parent, style="Surface.TFrame")
+        _, content = self._scroll_view(v)
         cfg = load_gen_config()
 
-        card, body = self._card(v, "Content", "1 · Niche")
+        card, body = self._card(content, "Content", "1 · Niche")
         ttk.Label(body, text="Niche", style="Muted.TLabel").pack(anchor="w")
         self.niche_txt = tk.Text(body, height=3, bg=SURFACE3, fg=FG, insertbackground=FG,
                                  relief="flat", font=("Segoe UI", 10), highlightthickness=1,
@@ -374,12 +539,12 @@ class App(tk.Tk):
         self.audience_e = self._entry(body, cfg["audience"])
         self.audience_e.pack(fill="x", pady=(4, 0))
 
-        card, body = self._card(v, "Script, Voice & Music", "2 · Style")
+        card, body = self._card(content, "Script, Voice & Music", "2 · Style")
         grid = ttk.Frame(body, style="Card.TFrame")
         grid.pack(fill="x")
         for c in range(4):
             grid.columnconfigure(c, weight=1)
-        ttk.Label(grid, text="Length", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(grid, text="Length (s)", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(grid, text="Voice", style="Muted.TLabel").grid(row=0, column=1, sticky="w", padx=(14, 0))
         ttk.Label(grid, text="Music", style="Muted.TLabel").grid(row=0, column=2, sticky="w", padx=(14, 0))
         ttk.Label(grid, text="", style="Muted.TLabel").grid(row=0, column=3)
@@ -402,7 +567,7 @@ class App(tk.Tk):
                                        style="Muted.TLabel")
         self.music_vol_lbl.pack(side="left")
 
-        card, body = self._card(v, "Publishing", "3 · Deliver")
+        card, body = self._card(content, "Publishing", "3 · Deliver")
         self.upload_on = tk.BooleanVar(value=False)
         ttk.Checkbutton(body, text="Upload to YouTube after building (requires OAuth setup)",
                         variable=self.upload_on, style="TCheckbutton").pack(anchor="w", pady=(0, 10))
@@ -412,15 +577,21 @@ class App(tk.Tk):
         self.publish_e = self._entry(row, "", width=34)
         self.publish_e.pack(side="left", padx=(12, 0))
 
-        card, body = self._card(v, "Run", "4 · Generate")
+        card, body = self._card(content, "Run", "4 · Generate")
         self.gen_bar = ttk.Progressbar(body, mode="determinate", maximum=100)
         self.gen_bar.pack(fill="x")
         pr = ttk.Frame(body, style="Card.TFrame")
         pr.pack(fill="x", pady=(8, 0))
+        self.gen_anim = ttk.Label(pr, text=" ", style="Card.TLabel",
+                                  foreground=ACCENT, font=("Consolas", 11))
+        self.gen_anim.pack(side="left")
         self.gen_stage = ttk.Label(pr, text="Idle", style="Stage.TLabel")
-        self.gen_stage.pack(side="left")
+        self.gen_stage.pack(side="left", padx=(6, 0))
         self.gen_pct = ttk.Label(pr, text="0%", style="Pct.TLabel")
         self.gen_pct.pack(side="right")
+        self.gen_log_btn = ttk.Button(body, text="View Run Log", style="Ghost.TButton",
+                                      state="disabled", command=lambda: self._open_log("generator"))
+        self.gen_log_btn.pack(anchor="e", pady=(10, 0))
         btns = ttk.Frame(body, style="Card.TFrame")
         btns.pack(fill="x", pady=(14, 0))
         self.gen_run_btn = ttk.Button(btns, text="Generate Video", style="Accent.TButton",
@@ -430,16 +601,30 @@ class App(tk.Tk):
                                        state="disabled", command=lambda: self._stop("generator"))
         self.gen_stop_btn.pack(side="left", padx=(12, 0))
 
-        card, body = self._card(v, "Latest Output", "5 · Result")
-        self.gen_out = ttk.Label(body, text="No video generated yet", style="Muted.TLabel")
+        card, body = self._card(content, "Output History", "5 · Results")
+        self.gen_out = ttk.Label(body, text="No videos generated yet", style="Muted.TLabel")
         self.gen_out.pack(anchor="w")
+        hist_frame = ttk.Frame(body, style="Card.TFrame")
+        hist_frame.pack(fill="x", pady=(8, 0))
+        self.gen_list = self._listbox(hist_frame, height=6)
+        self.gen_list.pack(side="left", fill="both", expand=True)
+        gsb = ttk.Scrollbar(hist_frame, command=self.gen_list.yview)
+        self.gen_list.configure(yscrollcommand=gsb.set)
+        gsb.pack(side="left", fill="y")
+        self.gen_list.bind("<<ListboxSelect>>", self._on_gen_select)
+        self.gen_list.bind("<Double-Button-1>", lambda _e: self._open_gen_file())
         out_row = ttk.Frame(body, style="Card.TFrame")
         out_row.pack(fill="x", pady=(10, 0))
-        ttk.Button(out_row, text="Open File", style="Ghost.TButton",
-                   command=lambda: self._open_gen_file()).pack(side="left")
+        self.gen_open_btn = ttk.Button(out_row, text="Open File", style="Ghost.TButton",
+                                       state="disabled", command=self._open_gen_file)
+        self.gen_open_btn.pack(side="left")
         ttk.Button(out_row, text="Open Folder", style="Ghost.TButton",
-                   command=lambda: self._open_output(GEN_DIR / "output")).pack(side="left", padx=(10, 0))
-        self._gen_out_path: Path | None = None
+                   command=lambda: self._open_output(GEN_OUT_DIR)).pack(side="left", padx=(10, 0))
+        self.gen_copy_btn = ttk.Button(out_row, text="Copy Path", style="Ghost.TButton",
+                                       state="disabled", command=self._copy_gen_path)
+        self.gen_copy_btn.pack(side="left", padx=(10, 0))
+        ttk.Button(out_row, text="Refresh", style="Ghost.TButton",
+                   command=self._refresh_gen_history).pack(side="right")
         return v
 
     def _sync_music_vol(self):
@@ -449,8 +634,9 @@ class App(tk.Tk):
     # --------------------------------------------------------- CLIP view ----
     def _build_clip(self, parent):
         v = ttk.Frame(parent, style="Surface.TFrame")
+        _, content = self._scroll_view(v)
 
-        card, body = self._card(v, "Source Video", "1 · Input")
+        card, body = self._card(content, "Source Video", "1 · Input")
         row = ttk.Frame(body, style="Card.TFrame")
         row.pack(fill="x")
         self.clip_src = self._entry(row, "", width=50)
@@ -458,7 +644,7 @@ class App(tk.Tk):
         ttk.Button(row, text="Browse", style="Ghost.TButton",
                    command=self._browse_clip_src).pack(side="left", padx=(10, 0))
 
-        card, body = self._card(v, "Shorts", "2 · Settings")
+        card, body = self._card(content, "Shorts", "2 · Settings")
         grid = ttk.Frame(body, style="Card.TFrame")
         grid.pack(fill="x")
         for c in range(3):
@@ -474,23 +660,29 @@ class App(tk.Tk):
         self.clip_min = self._spin(grid, 10, 120, 30)
         self.clip_min.grid(row=1, column=2, sticky="w", padx=(14, 0), pady=(4, 0))
 
-        card, body = self._card(v, "Output Folder", "3 · Destination")
+        card, body = self._card(content, "Output Folder", "3 · Destination")
         orow = ttk.Frame(body, style="Card.TFrame")
         orow.pack(fill="x")
-        self.clip_out = self._entry(orow, str(CLIP_DIR / "output"), width=50)
+        self.clip_out = self._entry(orow, str(CLIP_OUT_DIR), width=50)
         self.clip_out.pack(side="left", fill="x", expand=True)
         ttk.Button(orow, text="Browse", style="Ghost.TButton",
                    command=self._browse_clip_out).pack(side="left", padx=(10, 0))
 
-        card, body = self._card(v, "Run", "4 · Clip")
+        card, body = self._card(content, "Run", "4 · Clip")
         self.clip_bar = ttk.Progressbar(body, mode="determinate", maximum=100)
         self.clip_bar.pack(fill="x")
         pr = ttk.Frame(body, style="Card.TFrame")
         pr.pack(fill="x", pady=(8, 0))
+        self.clip_anim = ttk.Label(pr, text=" ", style="Card.TLabel",
+                                   foreground=ACCENT, font=("Consolas", 11))
+        self.clip_anim.pack(side="left")
         self.clip_stage = ttk.Label(pr, text="Idle", style="Stage.TLabel")
-        self.clip_stage.pack(side="left")
+        self.clip_stage.pack(side="left", padx=(6, 0))
         self.clip_pct = ttk.Label(pr, text="0%", style="Pct.TLabel")
         self.clip_pct.pack(side="right")
+        self.clip_log_btn = ttk.Button(body, text="View Run Log", style="Ghost.TButton",
+                                       state="disabled", command=lambda: self._open_log("clipper"))
+        self.clip_log_btn.pack(anchor="e", pady=(10, 0))
         btns = ttk.Frame(body, style="Card.TFrame")
         btns.pack(fill="x", pady=(14, 0))
         self.clip_run_btn = ttk.Button(btns, text="Clip Video", style="Accent.TButton",
@@ -500,13 +692,28 @@ class App(tk.Tk):
                                         state="disabled", command=lambda: self._stop("clipper"))
         self.clip_stop_btn.pack(side="left", padx=(12, 0))
 
-        card, body = self._card(v, "Latest Shorts", "5 · Result")
+        card, body = self._card(content, "Shorts History", "5 · Results")
         self.clip_out_lbl = ttk.Label(body, text="No shorts generated yet", style="Muted.TLabel")
         self.clip_out_lbl.pack(anchor="w")
+        hist_frame = ttk.Frame(body, style="Card.TFrame")
+        hist_frame.pack(fill="x", pady=(8, 0))
+        self.clip_list = self._listbox(hist_frame, height=6)
+        self.clip_list.pack(side="left", fill="both", expand=True)
+        csb = ttk.Scrollbar(hist_frame, command=self.clip_list.yview)
+        self.clip_list.configure(yscrollcommand=csb.set)
+        csb.pack(side="left", fill="y")
+        self.clip_list.bind("<<ListboxSelect>>", self._on_clip_select)
+        self.clip_list.bind("<Double-Button-1>", lambda _e: self._open_clip_folder())
         out_row = ttk.Frame(body, style="Card.TFrame")
         out_row.pack(fill="x", pady=(10, 0))
-        ttk.Button(out_row, text="Open Folder", style="Ghost.TButton",
-                   command=self._open_output).pack(side="left")
+        self.clip_open_btn = ttk.Button(out_row, text="Open Folder", style="Ghost.TButton",
+                                        state="disabled", command=self._open_clip_folder)
+        self.clip_open_btn.pack(side="left")
+        self.clip_copy_btn = ttk.Button(out_row, text="Copy Path", style="Ghost.TButton",
+                                        state="disabled", command=self._copy_clip_path)
+        self.clip_copy_btn.pack(side="left", padx=(10, 0))
+        ttk.Button(out_row, text="Refresh", style="Ghost.TButton",
+                   command=self._refresh_clip_history).pack(side="right")
         return v
 
     def _browse_clip_src(self):
@@ -531,6 +738,19 @@ class App(tk.Tk):
         if self._gen_out_path and self._gen_out_path.exists():
             os.startfile(str(self._gen_out_path))  # noqa: S606
 
+    def _copy(self, text: str):
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self._log("system", f"copied to clipboard: {text}", "ok")
+
+    def _copy_gen_path(self):
+        if self._gen_out_path:
+            self._copy(str(self._gen_out_path))
+
+    def _copy_clip_path(self):
+        if self._clip_selected:
+            self._copy(str(self._clip_selected))
+
     # ------------------------------------------------------- GUIDE view ----
     def _build_guide(self, parent):
         v = ttk.Frame(parent, style="Surface.TFrame")
@@ -550,6 +770,8 @@ class App(tk.Tk):
             "    - NVIDIA NIM key:    https://build.nvidia.com   -> put in generator/.env\n"
             "                           and clipper/.env (NVIDIA_API_KEY, LLM_PROVIDER=nvidia)\n"
             "    - Pexels key:        https://www.pexels.com/api/ -> generator/.env\n"
+            "    Run the app and watch the status bar / console: it checks ffmpeg, keys,\n"
+            "    and venvs for you at startup.\n"
             "\n"
             "2.  CREATE VIDEO  (faceless video from scratch)\n"
             "    a. Set Niche and Audience, e.g. Japanese culture / street food.\n"
@@ -558,6 +780,7 @@ class App(tk.Tk):
             "         script (AI) -> voiceover -> Whisper captions\n"
             "         -> b-roll (Pexels) -> ffmpeg assemble + music\n"
             "    d. Result: generator/output/<timestamp>_<topic>/final.mp4\n"
+            "       Find it in the Output History list (open / copy path / open folder).\n"
             "    e. To upload, run once:  generator\\.venv\\Scripts\\python.exe -m src.authorize\n"
             "       then tick 'Upload to YouTube'.\n"
             "\n"
@@ -572,6 +795,7 @@ class App(tk.Tk):
             "4.  TWEAKS\n"
             "    - generator/config.yaml : niche, length, voice, music, captions.\n"
             "    - clipper/.env : LOCAL_MIN_CLIP_DURATION, LOCAL_WHISPER_MODEL.\n"
+            "    - All GUI settings are remembered between sessions.\n"
             "\n"
             "5.  COSTS  (all free tiers)\n"
             "    NVIDIA NIM free (rate-limited) | edge-tts free | Whisper local free\n"
@@ -585,7 +809,7 @@ class App(tk.Tk):
     # ------------------------------------------------------------ console ---
     def _build_console(self):
         wrap = ttk.Frame(self, style="Surface.TFrame")
-        wrap.pack(fill="x", padx=16, pady=(0, 10))
+        wrap.pack(fill="x", padx=16, pady=(0, 8))
         head = ttk.Frame(wrap, style="Surface.TFrame")
         head.pack(fill="x", padx=4, pady=(4, 0))
         self.console_visible = tk.BooleanVar(value=True)
@@ -596,7 +820,7 @@ class App(tk.Tk):
         ttk.Button(head, text="Clear", style="Ghost.TButton",
                    command=self._clear_console).pack(side="right", padx=(0, 8))
         self.console = tk.Text(wrap, bg="#080a10", fg=MUTED, wrap="word", relief="flat",
-                               font=("Consolas", 9), height=11, state="disabled",
+                               font=("Consolas", 9), height=9, state="disabled",
                                insertbackground=FG, padx=10, pady=6)
         sb = ttk.Scrollbar(wrap, command=self.console.yview)
         self.console.configure(yscrollcommand=sb.set)
@@ -636,37 +860,116 @@ class App(tk.Tk):
             return "warn"
         return "sys"
 
+    # ------------------------------------------------------- status bar -----
+    def _build_statusbar(self):
+        bar = ttk.Frame(self, style="Surface.TFrame")
+        bar.pack(fill="x", padx=16, pady=(0, 6))
+        sep = tk.Frame(bar, bg=BORDER, height=1)
+        sep.pack(fill="x")
+        row = ttk.Frame(bar, style="Surface.TFrame")
+        row.pack(fill="x", pady=(6, 2))
+        self.env_lbl = ttk.Label(row, text="", style="Foot.TLabel")
+        self.env_lbl.pack(side="left")
+        self.out_lbl = ttk.Label(row, text="", style="Foot.TLabel")
+        self.out_lbl.pack(side="right")
+
+    def _refresh_statusbar(self, checks):
+        parts = []
+        for ok, text in checks:
+            mark = "ok" if ok else "warn"
+            style = "FootOk.TLabel" if ok else "FootErr.TLabel"
+            parts.append((style, f"{'✓' if ok else '✗'} {text}"))
+        self.env_lbl.configure(text="   ".join(t for _, t in parts))
+        self.out_lbl.configure(text=f"outputs: {GEN_OUT_DIR}  ·  {CLIP_OUT_DIR}")
+
+    def _doctor(self):
+        """Environment health check, logged to the console and status bar."""
+        checks = []
+        if find_ffmpeg():
+            checks.append((True, "ffmpeg: found"))
+        else:
+            checks.append((False, "ffmpeg: MISSING — winget install Gyan.FFmpeg"))
+        checks.append((GEN_PY.exists(), "generator venv: present"))
+        checks.append((CLIP_PY.exists(), "clipper venv: present"))
+        gen_env = _read_env(GEN_DIR / ".env")
+        checks.append((bool(gen_env.get("LLM_API_KEY")), "generator LLM key: set"))
+        checks.append((bool(gen_env.get("PEXELS_API_KEY")), "Pexels key: set"))
+        clip_env = _read_env(CLIP_DIR / ".env")
+        clip_llm = any(clip_env.get(k) for k in ("NVIDIA_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"))
+        checks.append((clip_llm, "clipper LLM key: set"))
+        self._refresh_statusbar(checks)
+        for ok, text in checks:
+            self._log("doctor", text, "ok" if ok else "err")
+
     # ----------------------------------------------------- progress tick ----
+    SPINNER = (" ", "●", "●○", "●○●", "●○", "●")
+
     def _tick_progress(self):
+        self._spinner += 1
+        spin = self.SPINNER[self._spinner % len(self.SPINNER)]
+
         g = self.gen_prog.tick()
         if g != self._last_gen_pct:
             self._last_gen_pct = g
             self.gen_bar.configure(value=g)
-            self.gen_pct.configure(text=f"{g}%")
+            self.gen_pct.configure(text=f"{g}%  ·  {_fmt_elapsed(self.gen_prog.elapsed())}")
         self.gen_stage.configure(text=self.gen_prog.stage)
+        self._style_stage(self.gen_stage, self.gen_prog.state)
+        self.gen_anim.configure(
+            text=spin if self.gen_prog.state == PipeProgress.RUNNING else " ")
+
         c = self.clip_prog.tick()
         if c != self._last_clip_pct:
             self._last_clip_pct = c
             self.clip_bar.configure(value=c)
-            self.clip_pct.configure(text=f"{c}%")
+            self.clip_pct.configure(text=f"{c}%  ·  {_fmt_elapsed(self.clip_prog.elapsed())}")
         self.clip_stage.configure(text=self.clip_prog.stage)
-        self.after(200, self._tick_progress)
+        self._style_stage(self.clip_stage, self.clip_prog.state)
+        self.clip_anim.configure(
+            text=spin if self.clip_prog.state == PipeProgress.RUNNING else " ")
+
+        self._jobs.append(self.after(200, self._tick_progress))
+
+    def _style_stage(self, lbl, state):
+        style = "Stage.TLabel"
+        if state == PipeProgress.RUNNING:
+            style = "StageRunning.TLabel"
+        elif state in (PipeProgress.FAILED,):
+            style = "StageErr.TLabel"
+        lbl.configure(style=style)
 
     def _poll_queue(self):
         try:
             while True:
-                tag, line = self.q.get_nowait()
-                if line is None:
-                    self._proc_done(tag)
+                item = self.q.get_nowait()
+                tag = item[0]
+                if len(item) > 2 and item[1] is None:
+                    self._proc_done(tag, item[2])
                     continue
-                self._log(tag, line, self._detect_level(line))
+                line = item[1]
+                level = self._detect_level(line)
+                self._log(tag, line, level)
+                self._write_run_log(tag, line)
+                if level == "err":
+                    self._last_error[tag] = line
                 if tag == "generator":
                     self._parse_gen_progress(line)
                 elif tag == "clipper":
                     self._parse_clip_progress(line)
         except queue.Empty:
             pass
-        self.after(80, self._poll_queue)
+        self._jobs.append(self.after(80, self._poll_queue))
+
+    def _write_run_log(self, tag: str, line: str):
+        entry = self._run_log.get(tag)
+        if not entry:
+            return
+        fh = entry[1]
+        try:
+            fh.write(f"{_now()}  {line}\n")
+            fh.flush()
+        except OSError:
+            pass
 
     def _parse_gen_progress(self, line: str):
         for idx, (rx, (label, weight)) in enumerate(GEN_STAGES):
@@ -693,20 +996,58 @@ class App(tk.Tk):
         if tag in self.procs:
             messagebox.showwarning("Already running", f"The {tag} is already running.")
             return False
+        self._save_state()
+        self._last_error.pop(tag, None)
+        self._open_run_log(tag, cmd)
         self._log("system", f"launching {tag}: {' '.join(str(c) for c in cmd)}", "sys")
         if tag == "generator":
             self.gen_run_btn.configure(state="disabled")
             self.gen_stop_btn.configure(state="normal")
-            self.gen_prog.start()
+            self.gen_log_btn.configure(state="disabled")
+            self.gen_out.configure(text="Starting…", foreground=ACCENT2)
+            self.gen_prog.start("Preparing…")
         else:
             self.clip_run_btn.configure(state="disabled")
             self.clip_stop_btn.configure(state="normal")
-            self.clip_prog.start()
-        self.status_pill.configure(text=f"●  {tag.title()} running", foreground=YELLOW)
+            self.clip_log_btn.configure(state="disabled")
+            self.clip_out_lbl.configure(text="Starting…", foreground=ACCENT2)
+            self.clip_prog.start("Preparing…")
+        self._update_status()
         t = ProcThread(self.q, tag, cmd, cwd, env)
         self.procs[tag] = t
         t.start()
         return True
+
+    def _open_run_log(self, tag: str, cmd):
+        LOG_DIR.mkdir(exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        path = LOG_DIR / f"{tag}-{stamp}.log"
+        try:
+            fh = open(path, "w", encoding="utf-8")
+        except OSError:
+            return
+        try:
+            fh.write(f"# {tag} run {stamp}\n# cmd: {' '.join(str(c) for c in cmd)}\n")
+            fh.flush()
+        except OSError:
+            pass
+        self._run_log[tag] = (path, fh)
+        self._last_log_path[tag] = path
+
+    def _close_run_log(self, tag: str):
+        entry = self._run_log.pop(tag, None)
+        if entry:
+            try:
+                entry[1].close()
+            except OSError:
+                pass
+
+    def _open_log(self, tag: str):
+        path = self._last_log_path.get(tag)
+        if path and path.exists():
+            os.startfile(str(path))  # noqa: S606
+        else:
+            messagebox.showinfo("No log yet", f"No run log for the {tag} yet.")
 
     def _stop(self, tag):
         t = self.procs.get(tag)
@@ -714,28 +1055,76 @@ class App(tk.Tk):
             self._log("system", f"stopping {tag}...", "warn")
             t.stop()
 
-    def _proc_done(self, tag):
+    def _proc_done(self, tag, code):
         if tag not in self.procs:
             return
-        self.procs.pop(tag)
-        self._log("system", f"{tag} pipeline finished", "sys")
-        if tag == "generator":
-            self.gen_prog.finish()
-            self.gen_run_btn.configure(state="normal")
-            self.gen_stop_btn.configure(state="disabled")
-            self._refresh_gen_output()
-        elif tag == "clipper":
-            self.clip_prog.finish()
-            self.clip_run_btn.configure(state="normal")
-            self.clip_stop_btn.configure(state="disabled")
-            self._refresh_clip_output()
-        self.status_pill.configure(text="●  Ready", foreground=GREEN)
+        thread = self.procs.pop(tag)
+        prog = self.gen_prog if tag == "generator" else self.clip_prog
+        btn_run = self.gen_run_btn if tag == "generator" else self.clip_run_btn
+        btn_stop = self.gen_stop_btn if tag == "generator" else self.clip_stop_btn
+        btn_log = self.gen_log_btn if tag == "generator" else self.clip_log_btn
+        out_lbl = self.gen_out if tag == "generator" else self.clip_out_lbl
+        self._close_run_log(tag)
+        btn_log.configure(state="normal")
+        if thread.stopped:
+            self._log("system", f"{tag} pipeline stopped", "warn")
+            prog.stop()
+            out_lbl.configure(text="Stopped", foreground=ORANGE)
+        elif code != 0:
+            err = self._last_error.get(tag, f"exited with code {code}")
+            self._log("system", f"{tag} pipeline FAILED: {err}", "err")
+            prog.fail("Failed")
+            out_lbl.configure(text=f"Failed — {err[:120]}", foreground=RED)
+        else:
+            self._log("system", f"{tag} pipeline finished", "ok")
+            prog.finish()
+            if tag == "generator":
+                self._refresh_gen_history(select_latest=True)
+            else:
+                self._refresh_clip_history(select_latest=True)
+        btn_run.configure(state="normal")
+        btn_stop.configure(state="disabled")
+        self._update_status()
+
+    def _update_status(self):
+        def name(state, label):
+            if state == PipeProgress.RUNNING:
+                return label, "running"
+            if state == PipeProgress.FAILED:
+                return label, "failed"
+            if state == PipeProgress.STOPPED:
+                return label, "stopped"
+            return None, None
+
+        g_state, g_label = name(self.gen_prog.state, "Generator")
+        c_state, c_label = name(self.clip_prog.state, "Clipper")
+        active = [(a, b) for a, b in ((g_state, g_label), (c_state, c_label)) if a]
+
+        if not active:
+            self.status_pill.configure(text="●  Ready", foreground=GREEN)
+        else:
+            failed = [a for a, b in active if b == "failed"]
+            stopped = [a for a, b in active if b == "stopped"]
+            running = [a for a, b in active if b == "running"]
+            if failed:
+                self.status_pill.configure(
+                    text=f"●  {', '.join(failed)} failed", foreground=RED)
+            elif running:
+                label = "2 pipelines running" if len(running) == 2 else f"{running[0]} running"
+                self.status_pill.configure(text=f"●  {label}", foreground=YELLOW)
+            elif stopped:
+                self.status_pill.configure(
+                    text=f"●  {', '.join(stopped)} stopped", foreground=ORANGE)
 
     def run_generator(self):
         cfg = load_gen_config()
         cfg["niche"] = self.niche_txt.get("1.0", "end").strip()
         cfg["audience"] = self.audience_e.get().strip()
-        cfg["script"]["target_seconds"] = int(float(self.seconds_sb.get() or 120))
+        try:
+            cfg["script"]["target_seconds"] = int(float(self.seconds_sb.get() or 120))
+        except ValueError:
+            messagebox.showerror("Invalid length", "Length must be a number (30–180).")
+            return
         cfg["voice"]["voice"] = self.voice_cb.get()
         cfg["music"]["enabled"] = bool(self.music_on.get())
         cfg["music"]["volume"] = round(int(float(self.music_vol.get())) / 100.0, 2)
@@ -754,7 +1143,7 @@ class App(tk.Tk):
         if not src:
             messagebox.showerror("Missing source", "Enter a YouTube URL or choose a local video file.")
             return
-        out = Path(self.clip_out.get().strip() or str(CLIP_DIR / "output"))
+        out = Path(self.clip_out.get().strip() or str(CLIP_OUT_DIR))
         cmd = [str(CLIP_PY), "main.py", src, "--mode", "local",
                "--num-clips", str(int(float(self.clip_num.get() or 3))),
                "--aspect-ratio", self.clip_ratio.get()]
@@ -765,30 +1154,157 @@ class App(tk.Tk):
             self._log("ok", f"Clipper started. Output: {out}")
 
     # ------------------------------------------------------------ results ---
-    def _refresh_gen_output(self):
-        base = GEN_DIR / "output"
-        if not base.exists():
+    def _refresh_gen_history(self, select_latest=False):
+        base = GEN_OUT_DIR
+        self.gen_list.delete(0, "end")
+        self._gen_hist = []
+        if base.exists():
+            dirs = [d for d in base.iterdir() if d.is_dir() and (d / "final.mp4").exists()]
+            dirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+            for d in dirs[:HISTORY_LIMIT]:
+                mtime = datetime.fromtimestamp(d.stat().st_mtime)
+                label = f"{d.name[:48]:<48}  {mtime:%Y-%m-%d %H:%M}"
+                self._gen_hist.append((label, d / "final.mp4"))
+                self.gen_list.insert("end", label)
+        if not self._gen_hist:
+            self.gen_out.configure(text="No videos generated yet", foreground=MUTED)
             return
-        dirs = [d for d in base.iterdir() if d.is_dir() and (d / "final.mp4").exists()]
-        if not dirs:
-            return
-        latest = max(dirs, key=lambda d: d.stat().st_mtime)
-        self._gen_out_path = latest / "final.mp4"
-        self.gen_out.configure(text=f"final.mp4  ·  {_now()}", foreground=GREEN)
+        idx = 0 if select_latest else -1
+        self.gen_list.selection_clear(0, "end")
+        self.gen_list.selection_set(idx)
+        self.gen_list.see(idx)
+        self._apply_gen_selection(idx)
 
-    def _refresh_clip_output(self):
-        out = Path(self.clip_out.get().strip() or str(CLIP_DIR / "output"))
-        if not out.exists():
+    def _on_gen_select(self, _e=None):
+        sel = self.gen_list.curselection()
+        if sel:
+            self._apply_gen_selection(sel[0])
+
+    def _apply_gen_selection(self, idx):
+        if 0 <= idx < len(self._gen_hist):
+            _, path = self._gen_hist[idx]
+            self._gen_out_path = path
+            mtime = datetime.fromtimestamp(path.parent.stat().st_mtime)
+            self.gen_out.configure(text=f"final.mp4  ·  {mtime:%Y-%m-%d %H:%M:%S}", foreground=GREEN)
+            self.gen_open_btn.configure(state="normal")
+            self.gen_copy_btn.configure(state="normal")
+
+    def _refresh_clip_history(self, select_latest=False):
+        out = Path(self.clip_out.get().strip() or str(CLIP_OUT_DIR))
+        self.clip_list.delete(0, "end")
+        self._clip_hist = []
+        self._clip_selected: Path | None = None
+        if out.exists():
+            found: dict[Path, list[Path]] = {}
+            for f in out.rglob("short_*.mp4"):
+                found.setdefault(f.parent, []).append(f)
+            folders = sorted(
+                found.items(),
+                key=lambda kv: max(p.stat().st_mtime for p in kv[1]),
+                reverse=True,
+            )
+            for folder, files in folders[:HISTORY_LIMIT]:
+                mtime = datetime.fromtimestamp(max(p.stat().st_mtime for p in files))
+                label = f"{str(folder)[:56]:<56}  {len(files)} shorts  {mtime:%Y-%m-%d %H:%M}"
+                self._clip_hist.append((label, folder))
+                self.clip_list.insert("end", label)
+        if not self._clip_hist:
+            self.clip_out_lbl.configure(text="No shorts generated yet", foreground=MUTED)
             return
-        shorts = sorted(out.glob("short_*.mp4"))
-        if shorts:
-            names = ", ".join(p.name for p in shorts)
-            self.clip_out_lbl.configure(text=f"{len(shorts)} short(s): {names}",
-                                        foreground=GREEN)
+        idx = 0 if select_latest else -1
+        self.clip_list.selection_clear(0, "end")
+        self.clip_list.selection_set(idx)
+        self.clip_list.see(idx)
+        self._apply_clip_selection(idx)
+
+    def _on_clip_select(self, _e=None):
+        sel = self.clip_list.curselection()
+        if sel:
+            self._apply_clip_selection(sel[0])
+
+    def _apply_clip_selection(self, idx):
+        if 0 <= idx < len(self._clip_hist):
+            _, folder = self._clip_hist[idx]
+            self._clip_selected = folder
+            n = len(list(folder.glob("short_*.mp4")))
+            self.clip_out_lbl.configure(text=f"{folder}  ·  {n} short(s)", foreground=GREEN)
+            self.clip_open_btn.configure(state="normal")
+            self.clip_copy_btn.configure(state="normal")
+
+    def _open_clip_folder(self):
+        if self._clip_selected:
+            os.makedirs(self._clip_selected, exist_ok=True)
+            os.startfile(str(self._clip_selected))  # noqa: S606
+
+    # ------------------------------------------------------- state save -----
+    def _gather_state(self) -> dict:
+        def _v(widget, default=""):
+            try:
+                return widget.get()
+            except Exception:
+                return default
+
+        return {
+            "view": self._view,
+            "create": {
+                "upload": bool(self.upload_on.get()),
+                "publish": _v(self.publish_e, ""),
+                "music_on": bool(self.music_on.get()),
+                "music_vol": _v(self.music_vol, "15"),
+            },
+            "clip": {
+                "src": _v(self.clip_src, ""),
+                "num": _v(self.clip_num, "3"),
+                "ratio": _v(self.clip_ratio, "9:16"),
+                "min": _v(self.clip_min, "30"),
+                "out": _v(self.clip_out, str(CLIP_OUT_DIR)),
+            },
+            "console_visible": bool(self.console_visible.get()),
+        }
+
+    def _save_state(self):
+        _write_json(STATE_FILE, self._gather_state())
+
+    def _restore_state(self):
+        create = self.state.get("create", {})
+        self.upload_on.set(bool(create.get("upload", False)))
+        self.publish_e.delete(0, "end")
+        self.publish_e.insert(0, create.get("publish", ""))
+        if "music_on" in create:
+            self.music_on.set(bool(create["music_on"]))
+        if "music_vol" in create:
+            try:
+                self.music_vol.set(int(float(create["music_vol"])))
+            except (TypeError, ValueError):
+                pass
+        clip = self.state.get("clip", {})
+        self.clip_src.delete(0, "end")
+        self.clip_src.insert(0, clip.get("src", ""))
+        if "num" in clip:
+            self.clip_num.delete(0, "end")
+            self.clip_num.insert(0, clip["num"])
+        if "ratio" in clip:
+            self.clip_ratio.set(clip["ratio"])
+        if "min" in clip:
+            self.clip_min.delete(0, "end")
+            self.clip_min.insert(0, clip["min"])
+        if "out" in clip:
+            self.clip_out.delete(0, "end")
+            self.clip_out.insert(0, clip["out"])
+        if not self.state.get("console_visible", True):
+            self._toggle_console()
 
     def _on_close(self):
+        for j in self._jobs:
+            try:
+                self.after_cancel(j)
+            except Exception:
+                pass
         for t in list(self.procs.values()):
             t.stop()
+        for tag in list(self._run_log):
+            self._close_run_log(tag)
+        self._save_state()
         self.destroy()
 
 

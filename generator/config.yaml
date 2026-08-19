@@ -1,46 +1,46 @@
-niche: "Japanese culture (history, food, traditions, festivals, landmarks, daily life, anime history, etiquette)"
-audience: "people fascinated by Japan who want to learn surprising cultural facts"
+niche: Weird Japanses rule
+audience: people fascinated by Japan who want to learn surprising cultural facts,
+  and random facts
 language: en
-
 script:
   model: meta/llama-3.3-70b-instruct
   target_seconds: 120
   words_per_second: 2.5
-
 voice:
   provider: edge
   voice: en-US-ChristopherNeural
-  rate: "-12%"
-  pitch: "+0Hz"
-
+  rate: -12%
+  pitch: +0Hz
 music:
   enabled: true
   volume: 0.15
   fade_in_seconds: 2
   tail_seconds: 4
-  file: ""
-
+  file: ''
 captions:
   whisper_model: base
-  font: "Anton"
+  font: Anton
   font_size: 90
-  primary_color: "&H00FFFFFF"
-  outline_color: "&H00000000"
+  primary_color: '&H00FFFFFF'
+  outline_color: '&H00000000'
   outline: 6
   words_per_caption: 3
   position_y: 0.55
-
 video:
   width: 1080
   height: 1920
   fps: 30
-
 upload:
-  privacy: "public"
-  category_id: "27"
+  privacy: public
+  category_id: '27'
   made_for_kids: false
-  default_tags: ["shorts", "japan", "japaneseculture", "didyouknow", "education", "travel"]
-
+  default_tags:
+  - shorts
+  - japan
+  - japaneseculture
+  - didyouknow
+  - education
+  - travel
 comments:
   model: meta/llama-3.1-8b-instruct
   poll_interval_minutes: 180

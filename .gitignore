@@ -10,11 +10,15 @@ venv/
 
 # Generated content
 output/
+logs/
 *.mp4
 *.m4a
 *.wav
 *.ass
 *.srt
+
+# GUI-local settings
+gui_state.json
 
 # OS / editor
 Thumbs.db

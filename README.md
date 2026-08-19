@@ -79,17 +79,28 @@ Three views (sidebar navigation):
 
 - **Create Video** — set niche / audience / length / voice / music, press *Generate
   Video*. Watch live **% progress** per stage (script → voice → captions →
-  b-roll → assembly), with a status pill and the latest output card. The full
-  script is always spoken — the last scene is padded so nothing gets cut, and a
-  synthesized ambient music bed is mixed under the narration.
+  b-roll → assembly), with a status pill, elapsed time, and a clickable
+  **Output History** of every finished video (open / copy path / open folder).
+  The full script is always spoken — the last scene is padded so nothing gets
+  cut, and a synthesized ambient music bed is mixed under the narration.
 - **Clip to Shorts** — paste a YouTube URL or pick a local file, choose clip
   count, aspect ratio (9:16 for Shorts/Reels), and a **minimum clip length** so
   shorts are never too short. Live % progress across download → transcript →
-  highlight ranking → rendering.
+  highlight ranking → rendering, plus a shorts **history list** grouped by
+  output folder.
 - **Guide** — the step-by-step reference below, in-app.
 
-Both pipelines run independently and can be started at the same time. Errors
-appear in red; stop any run with the red *Stop* button.
+Both pipelines run independently and can be started at the same time. Runs end
+in three clearly signalled states — **Done** (green), **Failed** (red, keeps the
+last error), or **Stopped** (amber) — so a failed run never looks like success.
+Every run writes a timestamped log to `logs/` (open it with the *View Run Log*
+button on each tab) — every line the pipeline printed, including any error.
+
+A bottom **status bar** runs an environment doctor at startup: it checks
+ffmpeg, both venvs, and the API keys in `generator/.env` / `clipper/.env`, so
+missing setup is visible before you press run. Every GUI setting (niche,
+length, voice, music, upload toggle, publish time, clip source, aspect, min
+length, output folder) is remembered in `gui_state.json` between sessions.
 
 ---
 

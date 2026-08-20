@@ -1,6 +1,7 @@
 import argparse
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from . import script, voice, captions, visuals, assemble, upload, state
 from .config import OUTPUT_DIR
@@ -11,7 +12,7 @@ def slug(s: str) -> str:
 
 
 def run_once(publish_at: str | None = None, upload_to_youtube: bool = True) -> dict:
-    print("[1/7] Generating script with Groq")
+    print("[1/7] Generating script (AI)")
     data = script.generate()
     print(f"      topic: {data['topic']}")
 
@@ -23,10 +24,14 @@ def run_once(publish_at: str | None = None, upload_to_youtube: bool = True) -> d
     voice_mp3 = voice.synth(data["full_text"], work / "voice.mp3")
 
     print("[3/7] Transcribing for word-level captions")
-    words = captions.transcribe_words(voice_mp3)
-
     print("[4/7] Fetching b-roll from Pexels")
-    scene_videos = visuals.fetch_for_scenes(data["scenes"], work / "broll")
+    # Transcription (CPU) and b-roll download (network) don't depend on each
+    # other, so run them at the same time and cut the wall-clock roughly in half.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        words_fut = pool.submit(captions.transcribe_words, voice_mp3)
+        broll_fut = pool.submit(visuals.fetch_for_scenes, data["scenes"], work / "broll")
+        words = words_fut.result()
+        scene_videos = broll_fut.result()
 
     print("[5/7] Writing caption file")
     from .config import CONFIG as CFG

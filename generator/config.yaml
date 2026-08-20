@@ -1,6 +1,5 @@
-niche: Weird Japanses rule
-audience: people fascinated by Japan who want to learn surprising cultural facts,
-  and random facts
+niche: Every Computer Generation Explain
+audience: People Who want to learn every computer generation
 language: en
 script:
   model: meta/llama-3.3-70b-instruct
@@ -11,9 +10,14 @@ voice:
   voice: en-US-ChristopherNeural
   rate: -12%
   pitch: +0Hz
+  engine: auto
+  eleven_voice: Karlo     # ElevenLabs voice name or ID
+  eleven_model: eleven_flash_v2_5
+  sapi_voice: ''
+  piper_model: ''
 music:
-  enabled: true
-  volume: 0.15
+  enabled: false
+  volume: 0.0
   fade_in_seconds: 2
   tail_seconds: 4
   file: ''
@@ -30,6 +34,7 @@ video:
   width: 1080
   height: 1920
   fps: 30
+  encoder: auto
 upload:
   privacy: public
   category_id: '27'

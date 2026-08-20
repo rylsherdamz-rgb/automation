@@ -24,7 +24,12 @@ from tkinter import ttk, filedialog, messagebox
 
 import yaml
 
-ROOT = Path(__file__).resolve().parent
+if getattr(sys, "frozen", False):
+    # Packaged app: the exe lives at dist/FacelessStudio/FacelessStudio.exe with
+    # generator/ and clipper/ (incl. their venvs) copied next to it.
+    ROOT = Path(sys.executable).resolve().parent
+else:
+    ROOT = Path(__file__).resolve().parent
 GEN_DIR = ROOT / "generator"
 CLIP_DIR = ROOT / "clipper"
 GEN_PY = GEN_DIR / ".venv" / "Scripts" / "python.exe"
@@ -35,6 +40,7 @@ CLIP_OUT_DIR = CLIP_DIR / "output"
 STATE_FILE = ROOT / "gui_state.json"
 LOG_DIR = ROOT / "logs"
 HISTORY_LIMIT = 12
+VERSION = "2.0.0"
 
 _FFMPEG_PKG = Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Packages"
 
@@ -57,6 +63,7 @@ MUTED = "#8d97ad"
 ACCENT = "#6d7cff"
 ACCENT2 = "#8f9bff"
 ACCENT_DIM = "#1b2140"
+SHIMMER = "#a8b4ff"
 GREEN = "#3ddc97"
 PINK = "#f472b6"
 RED = "#ff6b6b"
@@ -206,6 +213,8 @@ class PipeProgress:
         self.target = 0.0
         self.stage = "Idle"
         self.started = 0.0
+        self.stage_i = 0
+        self.stage_n = 0
         self._breathe = 0
 
     def start(self, label="Starting"):
@@ -214,14 +223,18 @@ class PipeProgress:
         self.pct = 3.0
         self.target = 6.0
         self.stage = label
+        self.stage_i = 0
+        self.stage_n = 0
         self._breathe = 0
 
-    def set_stage(self, base: float, weight: float, label: str):
+    def set_stage(self, base: float, weight: float, label: str, idx: int = 0, total: int = 0):
         if self.state != self.RUNNING:
             return
         self.pct = max(self.pct, base + 1.0)
         self.target = base + weight
         self.stage = label
+        self.stage_i = idx
+        self.stage_n = total
         self._breathe = 0
 
     def set_pct(self, pct: float, label: str):
@@ -301,6 +314,59 @@ class ProcThread(threading.Thread):
                 self.proc.terminate()
             except Exception:
                 pass
+
+
+# ------------------------------------------------------------------ widget ---
+class RoundedProgress(tk.Canvas):
+    """Smooth rounded progress bar with a sweeping shimmer while active."""
+
+    def __init__(self, master, height=12, **kw):
+        super().__init__(master, height=height, bg=SURFACE, highlightthickness=0,
+                         bd=0, **kw)
+        self._value = 0.0
+        self._active = False
+        self._phase = 0
+        self.bind("<Configure>", lambda _e: self._redraw())
+
+    def set(self, value: float, active: bool, phase: int = 0):
+        self._value = max(0.0, min(100.0, value))
+        self._active = active
+        self._phase = phase
+        self._redraw()
+
+    def _rr(self, x0, y0, x1, y1, r, **kw):
+        if x1 - x0 < 2 or y1 - y0 < 2:
+            return
+        r = max(0, min(r, (y1 - y0) / 2, (x1 - x0) / 2))
+        self.create_arc(x0, y0, x0 + 2 * r, y0 + 2 * r, start=90, extent=90,
+                        style="pieslice", **kw)
+        self.create_arc(x1 - 2 * r, y0, x1, y0 + 2 * r, start=0, extent=90,
+                        style="pieslice", **kw)
+        self.create_arc(x0, y1 - 2 * r, x0 + 2 * r, y1, start=180, extent=90,
+                        style="pieslice", **kw)
+        self.create_arc(x1 - 2 * r, y1 - 2 * r, x1, y1, start=270, extent=90,
+                        style="pieslice", **kw)
+        self.create_rectangle(x0 + r, y0, x1 - r, y1, **kw)
+        self.create_rectangle(x0, y0 + r, x1, y1 - r, **kw)
+
+    def _redraw(self):
+        self.delete("all")
+        w = self.winfo_width()
+        h = self.winfo_height() or 12
+        if w < 10:
+            return
+        r = h / 2
+        self._rr(0, 0, w, h, r, fill=SURFACE3, outline="")
+        fw = w * self._value / 100.0
+        if fw >= 1.0:
+            self._rr(0, 0, max(fw, h), h, r, fill=ACCENT, outline="")
+        if self._active:
+            band_w = w * 0.16
+            cx = (self._phase % 40) / 40.0 * (w + band_w) - band_w / 2
+            x0 = max(0.0, cx - band_w / 2)
+            x1 = min(fw if fw > 0 else w, cx + band_w / 2)
+            if x1 > x0:
+                self._rr(x0, 1, x1, h - 1, r - 1, fill=SHIMMER, outline="")
 
 
 # ------------------------------------------------------------------- app ---
@@ -395,6 +461,11 @@ class App(tk.Tk):
         st.map("TCheckbutton", background=[("active", SURFACE2)])
         st.configure("Horizontal.TProgressbar", background=ACCENT, troughcolor=SURFACE3,
                      borderwidth=0, thickness=8)
+        st.configure("Sep.TSeparator", background=BORDER)
+        st.configure("Chip.TLabel", background=ACCENT_DIM, foreground=ACCENT2,
+                     font=("Segoe UI", 8, "bold"), padding=(8, 3))
+        st.configure("ChipOk.TLabel", background="#143528", foreground=GREEN,
+                     font=("Segoe UI", 8, "bold"), padding=(8, 3))
 
     def _entry(self, parent, value="", width=34, show=None):
         e = tk.Entry(parent, bg=SURFACE3, fg=FG, insertbackground=FG, relief="flat",
@@ -423,12 +494,12 @@ class App(tk.Tk):
         card = ttk.Frame(parent, style="Card.TFrame")
         card.pack(fill="x", padx=2, pady=(0, 14))
         head = ttk.Frame(card, style="Card.TFrame")
-        head.pack(fill="x", padx=18, pady=(16, 4))
+        head.pack(fill="x", padx=18, pady=(16, 2))
         if section:
-            ttk.Label(head, text=section.upper(), style="Section.TLabel").pack(anchor="w")
-        ttk.Label(head, text=title, style="CardTitle.TLabel").pack(anchor="w", pady=(2, 0))
+            ttk.Label(head, text=section.upper(), style="Chip.TLabel").pack(anchor="w")
+        ttk.Label(head, text=title, style="CardTitle.TLabel").pack(anchor="w", pady=(6, 0))
         body = ttk.Frame(card, style="Card.TFrame")
-        body.pack(fill="x", padx=18, pady=(4, 16))
+        body.pack(fill="x", padx=18, pady=(6, 16))
         return card, body
 
     def _scroll_view(self, parent):
@@ -480,31 +551,37 @@ class App(tk.Tk):
 
     def _header(self):
         head = ttk.Frame(self)
-        head.pack(fill="x", padx=20, pady=(16, 14))
+        head.pack(fill="x", padx=20, pady=(14, 4))
         brand = ttk.Frame(head)
         brand.pack(side="left")
-        dot = tk.Canvas(brand, width=26, height=26, bg=BG, highlightthickness=0)
-        dot.create_rectangle(3, 3, 23, 23, fill=ACCENT, outline="")
-        dot.create_text(13, 13, text="F", fill="#fff", font=("Segoe UI", 12, "bold"))
-        dot.pack(side="left")
-        ttk.Label(brand, text="Faceless Studio", style="H1.TLabel").pack(side="left", padx=(12, 0))
-        ttk.Label(brand, text="AI video factory  ·  generator + clipper", style="Tag.TLabel").pack(anchor="w", padx=(38, 0))
+        logo = tk.Canvas(brand, width=30, height=30, bg=BG, highlightthickness=0)
+        logo.create_rectangle(1, 1, 29, 29, fill=ACCENT, outline="")
+        logo.create_rectangle(1, 15, 29, 29, fill=ACCENT2, outline="")
+        logo.create_text(15, 16, text="F", fill="#0b0e15", font=("Segoe UI", 13, "bold"))
+        logo.pack(side="left")
+        brand2 = ttk.Frame(brand, style="TFrame")
+        brand2.pack(side="left", padx=(12, 0))
+        ttk.Label(brand2, text="Faceless Studio", style="H1.TLabel").pack(anchor="w")
+        ttk.Label(brand2, text=f"AI video factory  ·  v{VERSION}", style="Tag.TLabel").pack(anchor="w")
         self.status_pill = ttk.Label(head, text="●  Ready", style="Pill.TLabel")
         self.status_pill.pack(side="right")
+        ttk.Separator(self, style="Sep.TSeparator").pack(fill="x", padx=20, pady=(10, 6))
 
     def _nav(self, root):
-        nav = ttk.Frame(root, style="Surface.TFrame", width=210)
+        nav = ttk.Frame(root, style="Surface.TFrame", width=220)
         nav.pack(side="left", fill="y")
         nav.pack_propagate(False)
-        ttk.Label(nav, text="MENU", style="Tag.TLabel").pack(anchor="w", padx=20, pady=(18, 6))
+        ttk.Label(nav, text="MENU", style="Tag.TLabel").pack(anchor="w", padx=22, pady=(18, 6))
         self.nav_btns: dict[str, ttk.Button] = {}
-        for key, label in (("create", "Create Video"), ("clip", "Clip to Shorts"), ("guide", "Guide")):
-            b = ttk.Button(nav, text=label, style="Nav.TButton",
+        for key, icon, label in (("create", "▶", "Create Video"),
+                                 ("clip", "✂", "Clip to Shorts"),
+                                 ("guide", "ℹ", "Guide")):
+            b = ttk.Button(nav, text=f"{icon}   {label}", style="Nav.TButton",
                            command=lambda k=key: self._set_view(k))
             b.pack(fill="x", padx=10, pady=2)
             self.nav_btns[key] = b
         ttk.Label(nav, text="LOCAL  ·  NVIDIA NIM  ·  FREE", style="Tag.TLabel").pack(
-            side="bottom", anchor="w", padx=20, pady=16)
+            side="bottom", anchor="w", padx=22, pady=16)
 
     def _set_view(self, key: str):
         self._view = key
@@ -578,7 +655,7 @@ class App(tk.Tk):
         self.publish_e.pack(side="left", padx=(12, 0))
 
         card, body = self._card(content, "Run", "4 · Generate")
-        self.gen_bar = ttk.Progressbar(body, mode="determinate", maximum=100)
+        self.gen_bar = RoundedProgress(body, height=12)
         self.gen_bar.pack(fill="x")
         pr = ttk.Frame(body, style="Card.TFrame")
         pr.pack(fill="x", pady=(8, 0))
@@ -587,6 +664,10 @@ class App(tk.Tk):
         self.gen_anim.pack(side="left")
         self.gen_stage = ttk.Label(pr, text="Idle", style="Stage.TLabel")
         self.gen_stage.pack(side="left", padx=(6, 0))
+        self.gen_counter = ttk.Label(pr, text="", style="Stage.TLabel")
+        self.gen_counter.pack(side="left", padx=(6, 0))
+        self.gen_elapsed = ttk.Label(pr, text="", style="Stage.TLabel")
+        self.gen_elapsed.pack(side="right", padx=(0, 10))
         self.gen_pct = ttk.Label(pr, text="0%", style="Pct.TLabel")
         self.gen_pct.pack(side="right")
         self.gen_log_btn = ttk.Button(body, text="View Run Log", style="Ghost.TButton",
@@ -669,7 +750,7 @@ class App(tk.Tk):
                    command=self._browse_clip_out).pack(side="left", padx=(10, 0))
 
         card, body = self._card(content, "Run", "4 · Clip")
-        self.clip_bar = ttk.Progressbar(body, mode="determinate", maximum=100)
+        self.clip_bar = RoundedProgress(body, height=12)
         self.clip_bar.pack(fill="x")
         pr = ttk.Frame(body, style="Card.TFrame")
         pr.pack(fill="x", pady=(8, 0))
@@ -678,6 +759,10 @@ class App(tk.Tk):
         self.clip_anim.pack(side="left")
         self.clip_stage = ttk.Label(pr, text="Idle", style="Stage.TLabel")
         self.clip_stage.pack(side="left", padx=(6, 0))
+        self.clip_counter = ttk.Label(pr, text="", style="Stage.TLabel")
+        self.clip_counter.pack(side="left", padx=(6, 0))
+        self.clip_elapsed = ttk.Label(pr, text="", style="Stage.TLabel")
+        self.clip_elapsed.pack(side="right", padx=(0, 10))
         self.clip_pct = ttk.Label(pr, text="0%", style="Pct.TLabel")
         self.clip_pct.pack(side="right")
         self.clip_log_btn = ttk.Button(body, text="View Run Log", style="Ghost.TButton",
@@ -905,30 +990,39 @@ class App(tk.Tk):
     SPINNER = (" ", "●", "●○", "●○●", "●○", "●")
 
     def _tick_progress(self):
-        self._spinner += 1
-        spin = self.SPINNER[self._spinner % len(self.SPINNER)]
+        try:
+            self._spinner += 1
+            spin = self.SPINNER[self._spinner % len(self.SPINNER)]
 
-        g = self.gen_prog.tick()
-        if g != self._last_gen_pct:
-            self._last_gen_pct = g
-            self.gen_bar.configure(value=g)
-            self.gen_pct.configure(text=f"{g}%  ·  {_fmt_elapsed(self.gen_prog.elapsed())}")
-        self.gen_stage.configure(text=self.gen_prog.stage)
-        self._style_stage(self.gen_stage, self.gen_prog.state)
-        self.gen_anim.configure(
-            text=spin if self.gen_prog.state == PipeProgress.RUNNING else " ")
+            g = self.gen_prog.tick()
+            self.gen_bar.set(g, self.gen_prog.state == PipeProgress.RUNNING, self._spinner)
+            self.gen_pct.configure(text=f"{g}%")
+            self.gen_elapsed.configure(text=f"⏱ {_fmt_elapsed(self.gen_prog.elapsed())}")
+            self.gen_stage.configure(text=self.gen_prog.stage)
+            self._style_stage(self.gen_stage, self.gen_prog.state)
+            self.gen_counter.configure(text=self._counter_text(self.gen_prog))
+            self.gen_anim.configure(
+                text=spin if self.gen_prog.state == PipeProgress.RUNNING else " ")
 
-        c = self.clip_prog.tick()
-        if c != self._last_clip_pct:
-            self._last_clip_pct = c
-            self.clip_bar.configure(value=c)
-            self.clip_pct.configure(text=f"{c}%  ·  {_fmt_elapsed(self.clip_prog.elapsed())}")
-        self.clip_stage.configure(text=self.clip_prog.stage)
-        self._style_stage(self.clip_stage, self.clip_prog.state)
-        self.clip_anim.configure(
-            text=spin if self.clip_prog.state == PipeProgress.RUNNING else " ")
+            c = self.clip_prog.tick()
+            self.clip_bar.set(c, self.clip_prog.state == PipeProgress.RUNNING, self._spinner)
+            self.clip_pct.configure(text=f"{c}%")
+            self.clip_elapsed.configure(text=f"⏱ {_fmt_elapsed(self.clip_prog.elapsed())}")
+            self.clip_stage.configure(text=self.clip_prog.stage)
+            self._style_stage(self.clip_stage, self.clip_prog.state)
+            self.clip_counter.configure(text=self._counter_text(self.clip_prog))
+            self.clip_anim.configure(
+                text=spin if self.clip_prog.state == PipeProgress.RUNNING else " ")
+        except tk.TclError:
+            return  # window destroyed; stop animating
 
         self._jobs.append(self.after(200, self._tick_progress))
+
+    @staticmethod
+    def _counter_text(prog) -> str:
+        if prog.state == PipeProgress.RUNNING and prog.stage_i > 0:
+            return f"stage {prog.stage_i}/{prog.stage_n}"
+        return ""
 
     def _style_stage(self, lbl, state):
         style = "Stage.TLabel"
@@ -975,7 +1069,7 @@ class App(tk.Tk):
         for idx, (rx, (label, weight)) in enumerate(GEN_STAGES):
             if rx.search(line):
                 base = sum(w for _, (_, w) in GEN_STAGES[:idx])
-                self.gen_prog.set_stage(base, weight, label)
+                self.gen_prog.set_stage(base, weight, label, idx + 1, len(GEN_STAGES))
                 return
 
     def _parse_clip_progress(self, line: str):
@@ -988,7 +1082,7 @@ class App(tk.Tk):
         for idx, (rx, (label, weight)) in enumerate(CLIP_STAGES):
             if rx.search(line):
                 base = sum(w for _, (_, w) in CLIP_STAGES[:idx])
-                self.clip_prog.set_stage(base, weight, label)
+                self.clip_prog.set_stage(base, weight, label, idx + 1, len(CLIP_STAGES))
                 return
 
     # ----------------------------------------------------------- runners ----

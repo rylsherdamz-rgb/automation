@@ -15,7 +15,14 @@ def _get_model() -> WhisperModel:
 
 def transcribe_words(audio_path: Path) -> list[dict]:
     model = _get_model()
-    segments, _ = model.transcribe(str(audio_path), word_timestamps=True)
+    segments, _ = model.transcribe(
+        str(audio_path),
+        word_timestamps=True,
+        beam_size=1,          # greedy decoding is far faster than 5-beam
+        best_of=1,
+        vad_filter=True,      # skip silence -> less audio to decode
+        condition_on_previous_text=False,  # avoids slow re-scoring loops
+    )
     words = []
     for seg in segments:
         for w in (seg.words or []):

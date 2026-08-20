@@ -20,6 +20,13 @@ logs/
 # GUI-local settings
 gui_state.json
 
+# Build artifacts
+dist/
+build/
+*.spec
+*.ico
+ui_preview.png
+
 # OS / editor
 Thumbs.db
 .DS_Store

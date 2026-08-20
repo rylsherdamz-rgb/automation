@@ -1,8 +1,63 @@
+import concurrent.futures
 import json
+import os
 import subprocess
 from pathlib import Path
 from .config import CONFIG, ROOT
 from . import music
+
+
+_ENCODER: str | None = None
+_NVENC_OK: bool | None = None
+
+
+def _nvenc_works() -> bool:
+    """Probe with a real 1-frame encode — encoder support in ffmpeg does NOT
+    mean a compatible NVIDIA GPU is present."""
+    global _NVENC_OK
+    if _NVENC_OK is not None:
+        return _NVENC_OK
+    probe_out = Path(os.environ.get("TEMP", ".")) / "nvenc_probe.mp4"
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=black:s=64x64:d=0.1",
+             "-c:v", "h264_nvenc", "-preset", "p5", "-frames:v", "1",
+             str(probe_out)],
+            capture_output=True, timeout=30, check=True,
+        )
+        _NVENC_OK = probe_out.exists()
+    except Exception:
+        _NVENC_OK = False
+    finally:
+        try:
+            probe_out.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return _NVENC_OK
+
+
+def _pick_encoder() -> str:
+    """Prefer NVIDIA NVENC (GPU, ~5-10x faster encode) when available."""
+    global _ENCODER
+    if _ENCODER is not None:
+        return _ENCODER
+    want = str(CONFIG.get("video", {}).get("encoder", "auto")).lower()
+    if want == "nvenc":
+        _ENCODER = "nvenc" if _nvenc_works() else "libx264"
+    elif want == "libx264":
+        _ENCODER = "libx264"
+    else:  # auto
+        _ENCODER = "nvenc" if _nvenc_works() else "libx264"
+    return _ENCODER
+
+
+def _enc_args(parallel_workers: int = 1) -> list[str]:
+    if _pick_encoder() == "nvenc":
+        return ["-c:v", "h264_nvenc", "-preset", "p5", "-cq", "23",
+                "-pix_fmt", "yuv420p"]
+    threads = max(1, (os.cpu_count() or 2) // parallel_workers)
+    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-threads", str(threads), "-pix_fmt", "yuv420p"]
 
 
 def _run(cmd: list[str]):
@@ -41,25 +96,25 @@ def _scene_durations(words: list[dict], scenes: list[dict]) -> list[float]:
     return durations
 
 
-def _prep_scene_clip(src: Path, target_dur: float, out_path: Path, w: int, h: int, fps: int):
+def _prep_scene_clip(src: Path, target_dur: float, out_path: Path, w: int, h: int, fps: int,
+                     parallel_workers: int = 1):
     src_dur = probe_duration(src)
     vf = (
         f"scale={w}:{h}:force_original_aspect_ratio=increase,"
         f"crop={w}:{h},setsar=1,fps={fps}"
     )
+    enc = _enc_args(parallel_workers)
     if src_dur >= target_dur:
         _run([
             "ffmpeg", "-y", "-ss", "0", "-t", f"{target_dur:.3f}", "-i", str(src),
-            "-vf", vf, "-an", "-c:v", "libx264", "-preset", "fast", "-crf", "20",
-            "-pix_fmt", "yuv420p", str(out_path),
+            "-vf", vf, "-an", *enc, str(out_path),
         ])
     else:
         loops = int(target_dur // src_dur) + 1
         _run([
             "ffmpeg", "-y", "-stream_loop", str(loops), "-i", str(src),
             "-t", f"{target_dur:.3f}", "-vf", vf, "-an",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "20",
-            "-pix_fmt", "yuv420p", str(out_path),
+            *enc, str(out_path),
         ])
 
 
@@ -109,11 +164,18 @@ def build(
         # Never cut the narration short — extend the last scene to cover the
         # full voiceover (edge-tts trailing silence included).
         durations[-1] += voice_dur - total
-    prepped = []
-    for i, (src, dur) in enumerate(zip(scene_videos, durations)):
-        out = work_dir / f"prep_{i:02d}.mp4"
-        _prep_scene_clip(src, dur, out, w, h, fps)
-        prepped.append(out)
+
+    # Independent scene trims encode in parallel (big multi-core win).
+    workers = min(3, max(1, (os.cpu_count() or 2) - 1))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {
+            ex.submit(_prep_scene_clip, src, dur, work_dir / f"prep_{i:02d}.mp4",
+                      w, h, fps, workers): i
+            for i, (src, dur) in enumerate(zip(scene_videos, durations))
+        }
+        for fut in concurrent.futures.as_completed(futures):
+            fut.result()  # re-raise any ffmpeg failure
+    prepped = [work_dir / f"prep_{i:02d}.mp4" for i in range(len(scene_videos))]
 
     concat_list = work_dir / "concat.txt"
     concat_list.write_text(
@@ -133,11 +195,12 @@ def build(
 
     ass_arg = str(captions_ass).replace("\\", "/").replace(":", "\\:")
     fonts_arg = str(ROOT / "assets" / "fonts").replace("\\", "/").replace(":", "\\:")
+    enc = _enc_args()
     _run([
         "ffmpeg", "-y", "-i", str(silent), "-i", str(mixed_audio),
         "-vf", f"subtitles='{ass_arg}':fontsdir='{fonts_arg}'",
-        "-c:v", "libx264", "-preset", "medium", "-crf", "20",
-        "-c:a", "aac", "-b:a", "192k", "-pix_fmt", "yuv420p",
+        *enc,
+        "-c:a", "aac", "-b:a", "192k",
         "-shortest", "-movflags", "+faststart",
         str(out_path),
     ])

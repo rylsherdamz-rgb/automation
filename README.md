@@ -13,7 +13,7 @@ single tkinter GUI to drive both:
 
 | Pipeline | Repo | What it does | Output |
 |---|---|---|---|
-| **Generator** | `generator/` (FreeFaceless) | AI script → edge-tts voiceover → word-timed captions (local Whisper) → Pexels b-roll → ffmpeg assembly with a background music bed | `generator/output/<ts>_<topic>/final.mp4` |
+| **Generator** | `generator/` (FreeFaceless) | AI script → voiceover (edge-tts w/ offline fallback) → word-timed captions (local Whisper) → Pexels b-roll (offline fallback) → ffmpeg assembly with a background music bed | `generator/output/<ts>_<topic>/final.mp4` |
 | **Clipper** | `clipper/` (AI-Youtube-Shorts-Generator) | Whisper transcript → LLM virality ranking → face-tracked 9:16 crop → captioned shorts | `clipper/output/short_0N.mp4` |
 
 Everything runs on free tiers. No subscriptions, no watermarks.
@@ -43,6 +43,7 @@ Create a `.env` in each project (templates already copied in):
   LLM_API_KEY=nvapi-...
   LLM_BASE_URL=https://integrate.api.nvidia.com/v1
   PEXELS_API_KEY=...
+  ELEVENLABS_API_KEY=sk_...   # optional premium voice (2nd fallback key: ELEVENLABS_API_KEY2)
   ```
 - `clipper/.env`:
   ```
@@ -52,10 +53,24 @@ Create a `.env` in each project (templates already copied in):
 
 | Service | Where to get it | Cost |
 |---|---|---|
-| NVIDIA NIM | https://build.nvidia.com → API keys | Free (rate-limited) |
+| NVIDIA NIM (default LLM) | https://build.nvidia.com → API keys | Free (rate-limited, can queue 1–3 min) |
 | Pexels | https://www.pexels.com/api/ | Free |
 | edge-tts (voice) | built-in | Free |
 | Whisper (captions) | local, downloaded once (~140 MB) | Free |
+
+**LLM provider** — the generator defaults to NVIDIA NIM only. To use a fast
+alternative such as DeepSeek, add your key and pin it:
+
+```
+# generator/.env
+DEEPSEEK_API_KEY=sk-...          # from https://platform.deepseek.com
+DEEPSEEK_MODEL=deepseek-chat     # or deepseek-reasoner
+LLM_PROVIDER=deepseek            # pin one provider: primary | xai | groq | deepseek
+LLM_TIMEOUT=180                  # seconds before giving up on one provider
+```
+
+`LLM_PROVIDER=all` tries NVIDIA first, then whichever of xAI/Groq/DeepSeek have
+keys, as fallbacks.
 
 > **Never commit `.env`.** Both sub-projects ignore it.
 
@@ -153,12 +168,18 @@ the full Google Cloud console setup.
 | `niche` / `audience` | Japan culture | Edit via GUI or here |
 | `script.target_seconds` | `120` | Video length; max `180` for Shorts |
 | `script.model` | `meta/llama-3.3-70b-instruct` | Any NVIDIA NIM model |
-| `voice.voice` | `en-US-ChristopherNeural` | Any edge-tts voice |
+| `voice.voice` | `en-US-ChristopherNeural` | Any edge-tts voice (or a Windows SAPI5 voice name) |
+| `voice.engine` | `auto` | `auto` (edge → elevenlabs → piper → sapi5) / `edge` / `elevenlabs` / `piper` / `sapi5` |
+| `voice.eleven_voice` | `Karlo` | ElevenLabs voice name or ID (premium TTS) |
+| `voice.eleven_model` | `eleven_flash_v2_5` | ElevenLabs model; `eleven_multilingual_v2` is higher quality, slower |
+| `voice.sapi_voice` | `""` | Optional Windows voice name/ID for the offline SAPI5 engine |
+| `voice.piper_model` | `""` | Path to a `.onnx` Piper model for offline neural quality |
 | `music.enabled` | `true` | Mixes ambient bed under narration |
 | `music.volume` | `0.15` | 0.05–0.30 feels best under voice |
 | `music.file` | `""` | Set to a local mp3/wav to use your own track |
 | `captions.whisper_model` | `base` | `tiny/base/small/medium/large-v3` |
 | `video.width/height` | `1080×1920` | Vertical 9:16 |
+| `video.encoder` | `auto` | `auto` (uses NVIDIA NVENC when a GPU is present) / `nvenc` / `libx264` |
 
 ### Clipper — `clipper/.env`
 
@@ -177,11 +198,49 @@ the full Google Cloud console setup.
 | Problem | Fix |
 |---|---|
 | `ffmpeg: command not found` | `winget install Gyan.FFmpeg`, restart terminal |
-| Pexels download times out | Flaky network — retries are built in; re-run |
+| Pexels download times out | The API is slow from some networks — each scene has a hard budget, then falls back to an animated offline background so the video still builds |
 | NVIDIA call is slow (1–2 min) | Normal for free NIM tier; it's queued |
 | `[WinError 32]` in clipper | OpenCV pinned to `<5`; if you reinstall, keep it there |
 | Clips are too short | Raise `LOCAL_MIN_CLIP_DURATION` (e.g. `45`) |
 | `GROQ_API_KEY` errors | Keys are now `LLM_API_KEY` (NVIDIA); see `generator/.env` |
+
+---
+
+## Package as a standalone app
+
+Turn the GUI into a Windows app you can run or share — no terminal needed.
+
+### Option A — Single-folder app (fastest)
+
+```
+powershell -ExecutionPolicy Bypass -File build_app.ps1
+```
+
+This builds `dist/FacelessStudio.exe` (PyInstaller one-folder build), copies the
+`generator/` and `clipper/` pipelines (with their venvs) next to it, generates an
+app icon, and zips everything to `dist/FacelessStudio.zip`. The zip can be copied
+to any Windows PC and unzipped anywhere (ffmpeg must still be installed).
+
+### Option B — Installer
+
+Install [Inno Setup 6](https://jrsoftware.org/isinfo.php), build the app with
+Option A, then:
+
+```
+iscc installer.iss
+```
+
+This creates `dist/FacelessStudio-Setup.exe` — a real installer with Start-menu
+and desktop shortcuts. **Note:** install into a user-writable folder (the default
+`C:\Program Files\...` needs admin; the installer defaults to a per-user path).
+
+### How it works
+
+- The GUI detects when it is frozen (`sys.frozen`) and resolves the pipeline
+  folders relative to the exe, so `generator/` and `clipper/` just have to sit next
+  to `FacelessStudio.exe` (the build script does this for you).
+- The two pipeline venvs are copied wholesale into the app folder — they are
+  self-contained, so the app has everything it needs except `ffmpeg` on `PATH`.
 
 ---
 

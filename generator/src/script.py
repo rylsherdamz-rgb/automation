@@ -1,10 +1,8 @@
 import json
 import re
 from openai import OpenAI
-from .config import LLM_API_KEY, LLM_BASE_URL, CONFIG
+from .config import LLM_TIMEOUT, LLM_RETRIES, llm_providers, CONFIG
 from . import state
-
-client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
 
 SYSTEM = """You write viral YouTube Shorts scripts for a faceless educational facts channel.
 
@@ -58,16 +56,31 @@ def generate():
         f"Generate ONE fresh Short now.{avoid}"
     )
 
-    resp = client.chat.completions.create(
-        model=CONFIG["script"]["model"],
-        max_tokens=4096,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": _system_prompt()},
-            {"role": "user", "content": user_msg},
-        ],
-    )
-    raw = resp.choices[0].message.content
-    data = _extract_json(raw)
-    data["full_text"] = " ".join(s["text"] for s in data["scenes"])
-    return data
+    providers = llm_providers()
+    if not providers:
+        raise RuntimeError("no LLM provider configured — set LLM_API_KEY in generator/.env")
+    last_err: Exception | None = None
+
+    for prov in providers:
+        try:
+            client = OpenAI(api_key=prov["api_key"], base_url=prov["base_url"],
+                            timeout=LLM_TIMEOUT, max_retries=LLM_RETRIES)
+            resp = client.chat.completions.create(
+                model=prov["model"],
+                max_tokens=4096,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": _system_prompt()},
+                    {"role": "user", "content": user_msg},
+                ],
+            )
+            print(f"      script provider: {prov['name']} ({prov['model']})", flush=True)
+            raw = resp.choices[0].message.content
+            data = _extract_json(raw)
+            data["full_text"] = " ".join(s["text"] for s in data["scenes"])
+            return data
+        except Exception as e:
+            last_err = e
+            print(f"[script] provider {prov['name']} failed: {e}", flush=True)
+
+    raise RuntimeError(f"all LLM providers failed: {last_err}")

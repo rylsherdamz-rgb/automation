@@ -27,7 +27,7 @@ LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://integrate.api.nvidia.com/
 PEXELS_API_KEY = os.environ["PEXELS_API_KEY"]
 
 LLM_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "180"))
-LLM_RETRIES = int(os.environ.get("LLM_RETRIES", "0"))
+LLM_RETRIES = int(os.environ.get("LLM_RETRIES", "2"))
 
 
 def llm_providers() -> list[dict]:

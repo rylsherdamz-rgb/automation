@@ -11,7 +11,7 @@ voice:
   rate: -12%
   pitch: +0Hz
   engine: auto
-  eleven_voice: Karlo     # ElevenLabs voice name or ID
+  eleven_voice: Karlo
   eleven_model: eleven_flash_v2_5
   sapi_voice: ''
   piper_model: ''

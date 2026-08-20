@@ -1,5 +1,6 @@
 import json
 import re
+import time
 from openai import OpenAI
 from .config import LLM_TIMEOUT, LLM_RETRIES, llm_providers, CONFIG
 from . import state
@@ -62,25 +63,39 @@ def generate():
     last_err: Exception | None = None
 
     for prov in providers:
-        try:
-            client = OpenAI(api_key=prov["api_key"], base_url=prov["base_url"],
-                            timeout=LLM_TIMEOUT, max_retries=LLM_RETRIES)
-            resp = client.chat.completions.create(
-                model=prov["model"],
-                max_tokens=4096,
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": _system_prompt()},
-                    {"role": "user", "content": user_msg},
-                ],
-            )
-            print(f"      script provider: {prov['name']} ({prov['model']})", flush=True)
-            raw = resp.choices[0].message.content
-            data = _extract_json(raw)
-            data["full_text"] = " ".join(s["text"] for s in data["scenes"])
-            return data
-        except Exception as e:
-            last_err = e
-            print(f"[script] provider {prov['name']} failed: {e}", flush=True)
+        client = OpenAI(api_key=prov["api_key"], base_url=prov["base_url"],
+                        timeout=LLM_TIMEOUT, max_retries=0)  # we handle retries below
+        for attempt in range(LLM_RETRIES + 1):
+            try:
+                resp = client.chat.completions.create(
+                    model=prov["model"],
+                    max_tokens=4096,
+                    response_format={"type": "json_object"},
+                    messages=[
+                        {"role": "system", "content": _system_prompt()},
+                        {"role": "user", "content": user_msg},
+                    ],
+                )
+                print(f"      script provider: {prov['name']} ({prov['model']})", flush=True)
+                raw = resp.choices[0].message.content
+                data = _extract_json(raw)
+                data["full_text"] = " ".join(s["text"] for s in data["scenes"])
+                return data
+            except Exception as e:
+                last_err = e
+                code = getattr(e, "status_code", None)
+                retryable = (
+                    code in (429, 500, 502, 503, 504)
+                    or "timed out" in str(e).lower()
+                    or isinstance(e, TimeoutError)
+                )
+                if attempt < LLM_RETRIES and retryable:
+                    wait = min(60, 10 * (2 ** attempt))  # 10s, 20s, 40s backoff
+                    print(f"[script] {prov['name']} {code or type(e).__name__}; "
+                          f"retrying in {wait}s ({attempt + 1}/{LLM_RETRIES})", flush=True)
+                    time.sleep(wait)
+                else:
+                    print(f"[script] provider {prov['name']} failed: {e}", flush=True)
+                    break
 
     raise RuntimeError(f"all LLM providers failed: {last_err}")
